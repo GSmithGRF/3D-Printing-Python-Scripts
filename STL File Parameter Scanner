@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+stl_orcaslicer_advisor.py
+
+Scans an STL (ASCII or binary), evaluates candidate orientations, and prints
+very basic, sectioned, step-by-step instructions for OrcaSlicer.
+
+Key features:
+- STL parsing (ASCII + binary)
+- Orientation search (90° grid + optional random samples + optional PCA candidate)
+- Heuristic scoring for:
+  - support-required “downfacing” area proxy
+  - print height
+  - bed-contact footprint proxy (adhesion/stability)
+- IntelliJ-friendly quick-run:
+  - If run with NO CLI arguments, it will locate STL_NAME automatically.
+  - This version can search the entire Windows computer INCLUDING flash drives
+    (any drive with a letter).
+
+Usage (CLI):
+  python stl_orcaslicer_advisor.py path\\to\\model.stl --pca --overhang 45
+
+Usage (IntelliJ quick-run):
+  - Leave run arguments empty
+  - Set STL_NAME at bottom
+  - Run ▶
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import struct
+import string
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple
+
+import numpy as np
+
+
+# -----------------------------
+# STL loading (ASCII + binary)
+# -----------------------------
+
+def _is_probably_ascii_stl(path: str) -> bool:
+    with open(path, "rb") as f:
+        head = f.read(512)
+    nontext = sum(b < 9 or (13 < b < 32) for b in head)
+    return nontext == 0 and head.lstrip().startswith(b"solid")
+
+
+def load_stl_triangles(path: str) -> np.ndarray:
+    """
+    Returns triangles as float32 array shaped (N, 3, 3) in STL units (typically mm).
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+
+    if _is_probably_ascii_stl(path):
+        try:
+            return _load_ascii_stl(path)
+        except Exception:
+            return _load_binary_stl(path)
+    return _load_binary_stl(path)
+
+
+def _load_binary_stl(path: str) -> np.ndarray:
+    with open(path, "rb") as f:
+        _header = f.read(80)
+        (n_tri,) = struct.unpack("<I", f.read(4))
+        data = f.read(n_tri * 50)
+
+    if len(data) != n_tri * 50:
+        raise ValueError("Binary STL appears truncated or invalid.")
+
+    triangles = np.empty((n_tri, 3, 3), dtype=np.float32)
+    offset = 0
+    for i in range(n_tri):
+        offset += 12  # normal
+        v1 = struct.unpack_from("<fff", data, offset); offset += 12
+        v2 = struct.unpack_from("<fff", data, offset); offset += 12
+        v3 = struct.unpack_from("<fff", data, offset); offset += 12
+        offset += 2   # attribute byte count
+        triangles[i, 0, :] = v1
+        triangles[i, 1, :] = v2
+        triangles[i, 2, :] = v3
+    return triangles
+
+
+def _load_ascii_stl(path: str) -> np.ndarray:
+    verts: List[Tuple[float, float, float]] = []
+    tris: List[List[int]] = []
+    current: List[int] = []
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip().split()
+            if not s:
+                continue
+            if s[0].lower() == "vertex" and len(s) >= 4:
+                v = (float(s[1]), float(s[2]), float(s[3]))
+                verts.append(v)
+                current.append(len(verts) - 1)
+            elif s[0].lower() == "endloop":
+                if len(current) == 3:
+                    tris.append(current)
+                current = []
+
+    if not tris:
+        raise ValueError("No triangles found in ASCII STL parse.")
+
+    v = np.array(verts, dtype=np.float32)
+    triangles = np.empty((len(tris), 3, 3), dtype=np.float32)
+    for i, t in enumerate(tris):
+        triangles[i, :, :] = v[np.array(t, dtype=np.int32)]
+    return triangles
+
+
+# -----------------------------
+# File finding helper (quick-run)
+# -----------------------------
+
+def _windows_list_drives() -> List[Path]:
+    drives: List[Path] = []
+    for letter in string.ascii_uppercase:
+        root = Path(f"{letter}:\\")
+        if root.exists():
+            drives.append(root)
+    return drives
+
+
+def find_stl_by_name(filename: str, max_hits: int = 10) -> str:
+    """
+    Locate an STL file by name across:
+      - current working directory (fast)
+      - then all Windows drive letters (fixed + removable, includes flash drives)
+
+    Returns the "best" match path or raises FileNotFoundError.
+
+    Best match heuristic:
+      1) shallowest path depth
+      2) newest modified time
+    """
+    name = filename.strip()
+    if not name:
+        raise FileNotFoundError("STL_NAME is empty. Set STL_NAME to something like 'part.stl'.")
+
+    p = Path(name)
+    if p.exists() and p.is_file():
+        return str(p.resolve())
+
+    target_lower = Path(name).name.lower()
+    hits: List[Path] = []
+
+    # Fast pass: current working directory
+    try:
+        for path in Path.cwd().rglob("*"):
+            try:
+                if path.is_file() and path.name.lower() == target_lower:
+                    hits.append(path)
+                    if len(hits) >= max_hits:
+                        break
+            except (PermissionError, OSError):
+                continue
+    except (PermissionError, OSError):
+        pass
+
+    # Full scan: all drives (includes USB drives)
+    if not hits:
+        for drive in _windows_list_drives():
+            try:
+                for root, dirs, files in os.walk(drive, topdown=True):
+                    for fn in files:
+                        if fn.lower() == target_lower:
+                            hits.append(Path(root) / fn)
+                            if len(hits) >= max_hits:
+                                raise StopIteration
+            except StopIteration:
+                break
+            except (PermissionError, OSError):
+                continue
+
+    if not hits:
+        raise FileNotFoundError(
+            f"Could not find '{target_lower}' on any drive. "
+            "Verify the exact filename and extension (e.g., 'part.stl')."
+        )
+
+    def rank(path: Path) -> Tuple[int, float]:
+        depth = len(path.parts)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (depth, -mtime)
+
+    hits.sort(key=rank)
+    return str(hits[0].resolve())
+
+
+# -----------------------------
+# Geometry helpers
+# -----------------------------
+
+def triangle_normals_and_areas(tris: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    v1 = tris[:, 1, :] - tris[:, 0, :]
+    v2 = tris[:, 2, :] - tris[:, 0, :]
+    cross = np.cross(v1, v2)
+    area2 = np.linalg.norm(cross, axis=1)
+    areas = 0.5 * area2
+    with np.errstate(invalid="ignore", divide="ignore"):
+        normals = cross / area2[:, None]
+    normals[~np.isfinite(normals)] = 0.0
+    return normals.astype(np.float32), areas.astype(np.float32)
+
+
+def bounds(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    return np.min(points, axis=0), np.max(points, axis=0)
+
+
+def rotation_matrix_xyz(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx, ry, rz = map(math.radians, (rx_deg, ry_deg, rz_deg))
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    Rx = np.array([[1, 0, 0],
+                   [0, cx, -sx],
+                   [0, sx, cx]], dtype=np.float32)
+    Ry = np.array([[cy, 0, sy],
+                   [0, 1, 0],
+                   [-sy, 0, cy]], dtype=np.float32)
+    Rz = np.array([[cz, -sz, 0],
+                   [sz, cz, 0],
+                   [0, 0, 1]], dtype=np.float32)
+
+    return (Rz @ Ry @ Rx).astype(np.float32)
+
+
+def apply_rotation(tris: np.ndarray, R: np.ndarray) -> np.ndarray:
+    return (tris.reshape(-1, 3) @ R.T).reshape(tris.shape)
+
+
+def pca_alignment_rotation(tris: np.ndarray) -> np.ndarray:
+    pts = tris.reshape(-1, 3).astype(np.float64)
+    center = pts.mean(axis=0)
+    ptsc = pts - center
+    cov = np.cov(ptsc.T)
+    w, V = np.linalg.eigh(cov)
+    idx = np.argsort(w)[::-1]
+    V = V[:, idx]
+    if np.linalg.det(V) < 0:
+        V[:, -1] *= -1
+    return V.T.astype(np.float32)
+
+
+def projected_footprint_area_proxy(tris: np.ndarray, z_tol: float = 0.25) -> float:
+    pts = tris.reshape(-1, 3)
+    zmin = float(np.min(pts[:, 2]))
+    z = tris[:, :, 2]
+    near = np.any(z <= (zmin + z_tol), axis=1)
+    _, areas = triangle_normals_and_areas(tris)
+    return float(np.sum(areas[near]))
+
+
+def downfacing_overhang_area(tris: np.ndarray, overhang_deg: float) -> float:
+    normals, areas = triangle_normals_and_areas(tris)
+    thresh = -math.cos(math.radians(overhang_deg))
+    mask = normals[:, 2] < thresh
+    return float(np.sum(areas[mask]))
+
+
+# -----------------------------
+# Orientation result + scoring
+# -----------------------------
+
+@dataclass
+class OrientationResult:
+    label: str
+    rx: float
+    ry: float
+    rz: float
+    size_xyz: Tuple[float, float, float]
+    height: float
+    footprint_proxy: float
+    support_area: float
+    fits: bool
+    score: float
+
+
+def evaluate_orientation(
+        tris: np.ndarray,
+        R: np.ndarray,
+        label: str,
+        rx: float,
+        ry: float,
+        rz: float,
+        build_xyz: Tuple[float, float, float],
+        clearance: float,
+        overhang_deg: float,
+) -> OrientationResult:
+    t = apply_rotation(tris, R)
+    pts = t.reshape(-1, 3)
+    mn, mx = bounds(pts)
+    size = mx - mn
+    size_xyz = (float(size[0]), float(size[1]), float(size[2]))
+    height = float(size[2])
+
+    fits = (
+            size_xyz[0] <= (build_xyz[0] - clearance)
+            and size_xyz[1] <= (build_xyz[1] - clearance)
+            and size_xyz[2] <= (build_xyz[2] - clearance)
+    )
+
+    footprint = projected_footprint_area_proxy(t)
+    support_area = downfacing_overhang_area(t, overhang_deg)
+
+    eps = 1e-6
+    footprint_penalty = 1.0 / (footprint + eps)
+
+    score = (5.0 * support_area) + (1.0 * height) + (2000.0 * footprint_penalty)
+    if not fits:
+        score += 1e9
+
+    return OrientationResult(
+        label=label,
+        rx=rx, ry=ry, rz=rz,
+        size_xyz=size_xyz,
+        height=height,
+        footprint_proxy=footprint,
+        support_area=support_area,
+        fits=fits,
+        score=float(score),
+    )
+
+
+def generate_candidate_rotations(samples: int) -> List[Tuple[np.ndarray, str, float, float, float]]:
+    candidates: List[Tuple[np.ndarray, str, float, float, float]] = []
+
+    for rx in (0, 90, 180, 270):
+        for ry in (0, 90, 180, 270):
+            for rz in (0, 90, 180, 270):
+                R = rotation_matrix_xyz(rx, ry, rz)
+                candidates.append((R, "GRID", float(rx), float(ry), float(rz)))
+
+    rng = np.random.default_rng(42)
+    for _ in range(max(0, samples)):
+        rx = float(rng.uniform(0, 360))
+        ry = float(rng.uniform(0, 360))
+        rz = float(rng.uniform(0, 360))
+        R = rotation_matrix_xyz(rx, ry, rz)
+        candidates.append((R, "RAND", rx, ry, rz))
+
+    return candidates
+
+
+# -----------------------------
+# Basic, sectioned output logic
+# -----------------------------
+
+def _fmt_mm(x: float) -> str:
+    return f"{x:.1f} mm"
+
+
+def _support_bucket(support_area: float) -> str:
+    # Very simple buckets for human instructions
+    if support_area < 50:
+        return "MINIMAL"
+    if support_area < 500:
+        return "MODERATE"
+    return "HEAVY"
+
+
+def _rotation_lines(best: OrientationResult) -> List[str]:
+    # Keep it extremely simple and explicit.
+    if best.label == "PCA" or (math.isnan(best.rx) or math.isnan(best.ry) or math.isnan(best.rz)):
+        return [
+            "3. Use the PCA alignment option.",
+            "   (This one cannot be shown as exact X/Y/Z degrees. Rotate by hand until you have the flattest base.)",
+        ]
+    return [
+        "3. Rotate the model to these values:",
+        f"   - X rotation: {best.rx:.0f}°",
+        f"   - Y rotation: {best.ry:.0f}°",
+        f"   - Z rotation: {best.rz:.0f}°",
+    ]
+
+
+def print_basic_instructions(
+        stl_path: str,
+        tri_count: int,
+        raw_size_xyz: Tuple[float, float, float],
+        best: OrientationResult,
+        alts: List[OrientationResult],
+        args: argparse.Namespace
+) -> None:
+    print()
+    print("PRINT INSTRUCTIONS (OrcaSlicer)")
+    print("=" * 31)
+    print()
+    print("FILE INFORMATION")
+    print("-" * 16)
+    print("Model file:")
+    print(stl_path)
+    print()
+    print("Model complexity:")
+    print(f"{tri_count:,} triangles")
+    print()
+    print("Original model size (before rotating):")
+    print(f"{_fmt_mm(raw_size_xyz[0])} wide × {_fmt_mm(raw_size_xyz[1])} deep × {_fmt_mm(raw_size_xyz[2])} tall")
+    print()
+    print()
+    print("SECTION 1 — ORIENT THE MODEL")
+    print("-" * 28)
+    print("1. Open OrcaSlicer.")
+    print("2. Import the STL file.")
+    for line in _rotation_lines(best):
+        print(line)
+    print()
+    print()
+    print("SECTION 2 — PLACE THE MODEL")
+    print("-" * 27)
+    print("4. Right-click the model.")
+    print("5. Click Center.")
+    print("6. Right-click the model again.")
+    print("7. Click Drop to bed.")
+    print()
+    print()
+    print("SECTION 3 — CONFIRM FIT")
+    print("-" * 22)
+    print("8. After rotating, the model size should be:")
+    print(f"   - Width (X):  {_fmt_mm(best.size_xyz[0])}")
+    print(f"   - Depth (Y):  {_fmt_mm(best.size_xyz[1])}")
+    print(f"   - Height (Z): {_fmt_mm(best.size_xyz[2])}")
+    print()
+    if best.fits:
+        print("9. Fit result: THIS FITS THE PRINTER.")
+        print(f"   (Clearance setting used: {args.clearance:.1f} mm)")
+        print("   No scaling is required.")
+    else:
+        print("9. Fit result: THIS DOES NOT FIT THE PRINTER.")
+        print(f"   (Clearance setting used: {args.clearance:.1f} mm)")
+        print("   Fix: scale down, split the model, or change orientation.")
+    print()
+    print()
+    print("SECTION 4 — SUPPORT SETTINGS")
+    print("-" * 28)
+    bucket = _support_bucket(best.support_area)
+    if best.support_area > 1.0:
+        print("10. Turn Supports ON.")
+        print("11. Set supports to Build plate only.")
+        print()
+        print("Why:")
+        print(f"- Support estimate: {bucket} (proxy area ~{best.support_area:.0f} mm² at overhang {args.overhang:.0f}°)")
+        print()
+        print("12. Switch to Preview mode and confirm:")
+        print("    - Supports are not touching visible/cosmetic surfaces.")
+    else:
+        print("10. Supports: leave OFF.")
+        print()
+        print("Why:")
+        print(f"- Support estimate: {bucket}")
+    print()
+    print()
+    print("SECTION 5 — BED ADHESION")
+    print("-" * 23)
+    # Keep logic simple
+    if best.footprint_proxy < 250.0:
+        print("13. Enable a brim.")
+        print("14. Set brim width to 3–6 mm.")
+        print()
+        print("Why:")
+        print("- The bottom of the model is small. A brim helps it stay stuck to the bed.")
+    elif best.footprint_proxy < 500.0 and best.height > 80.0:
+        print("13. Enable a brim.")
+        print("14. Set brim width to 5–8 mm.")
+        print()
+        print("Why:")
+        print("- The model is tall and may be less stable. A brim helps prevent tipping.")
+    else:
+        print("13. Brim: usually not required.")
+        print("    Only add a brim if you see edge lift.")
+    print()
+    print()
+    print("SECTION 6 — PRINT QUALITY BASELINE")
+    print("-" * 33)
+    print("15. Use these starting settings:")
+    print("    - Layer height: 0.20 mm")
+    print("    - Nozzle: 0.4 mm")
+    print()
+    print("These are safe defaults. Adjust later only if needed.")
+    print()
+    print()
+    print("SECTION 7 — FINAL CHECK BEFORE PRINTING")
+    print("-" * 40)
+    print("16. Open Preview.")
+    print("17. Check:")
+    print("    - Supports look reasonable (if enabled).")
+    print("    - Overhangs and bridges look supported.")
+    print("    - The first layer is solid and continuous.")
+    print("18. If everything looks correct, start the print.")
+    print()
+    print()
+    print("ALTERNATIVE ORIENTATIONS (IF NEEDED)")
+    print("-" * 36)
+    if not alts:
+        print("No alternative orientations were listed.")
+    else:
+        for idx, a in enumerate(alts, start=1):
+            if a.label == "PCA" or (math.isnan(a.rx) or math.isnan(a.ry) or math.isnan(a.rz)):
+                print(f"Option {idx}: PCA alignment (manual rotate for flattest base).")
+            else:
+                print(f"Option {idx}: Rotate to X={a.rx:.0f}°, Y={a.ry:.0f}°, Z={a.rz:.0f}°")
+        print()
+        print("After changing orientation:")
+        print("- Center the model")
+        print("- Drop to bed")
+        print("- Recheck supports in Preview")
+    print()
+    print()
+    print("STATUS")
+    print("-" * 6)
+    print("Setup complete.")
+    print("Ready to print.")
+    print()
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("stl", help="Path to STL file (ASCII or binary).")
+    ap.add_argument("--build-x", type=float, default=220.0, help="Build volume X (mm). Default 220.")
+    ap.add_argument("--build-y", type=float, default=220.0, help="Build volume Y (mm). Default 220.")
+    ap.add_argument("--build-z", type=float, default=220.0, help="Build volume Z (mm). Default 220.")
+    ap.add_argument("--clearance", type=float, default=4.0, help="Safety clearance from build limits (mm).")
+    ap.add_argument("--overhang", type=float, default=45.0, help="Overhang angle threshold (deg). Default 45.")
+    ap.add_argument("--samples", type=int, default=0, help="Extra random rotations to test (0-500).")
+    ap.add_argument("--pca", action="store_true", help="Include PCA-based alignment candidate.")
+    ap.add_argument("--show-alts", type=int, default=3, help="How many alternative orientations to show. Default 3.")
+    args = ap.parse_args()
+
+    build_xyz = (args.build_x, args.build_y, args.build_z)
+    tris = load_stl_triangles(args.stl)
+
+    # Raw size
+    pts = tris.reshape(-1, 3)
+    mn0, mx0 = bounds(pts)
+    size0 = mx0 - mn0
+    raw_size_xyz = (float(size0[0]), float(size0[1]), float(size0[2]))
+
+    # Evaluate candidates
+    samples = max(0, min(int(args.samples), 500))
+    candidates = generate_candidate_rotations(samples=samples)
+
+    results: List[OrientationResult] = []
+    for R, label, rx, ry, rz in candidates:
+        results.append(
+            evaluate_orientation(
+                tris=tris,
+                R=R,
+                label=label,
+                rx=rx, ry=ry, rz=rz,
+                build_xyz=build_xyz,
+                clearance=args.clearance,
+                overhang_deg=args.overhang,
+            )
+        )
+
+    if args.pca:
+        Rpca = pca_alignment_rotation(tris)
+        results.append(
+            evaluate_orientation(
+                tris=tris,
+                R=Rpca,
+                label="PCA",
+                rx=float("nan"), ry=float("nan"), rz=float("nan"),
+                build_xyz=build_xyz,
+                clearance=args.clearance,
+                overhang_deg=args.overhang,
+            )
+        )
+
+    results.sort(key=lambda r: r.score)
+    best = results[0]
+
+    # Alternatives: only show ones that fit if best fits
+    alts: List[OrientationResult] = []
+    for r in results[1:]:
+        if len(alts) >= max(0, int(args.show_alts)):
+            break
+        if best.fits and not r.fits:
+            continue
+        # Don't spam duplicates (common when 90° rotations yield same metrics)
+        if (not math.isnan(r.rx)) and (not math.isnan(best.rx)):
+            if int(r.rx) == int(best.rx) and int(r.ry) == int(best.ry) and int(r.rz) == int(best.rz):
+                continue
+        alts.append(r)
+
+    print_basic_instructions(
+        stl_path=args.stl,
+        tri_count=tris.shape[0],
+        raw_size_xyz=raw_size_xyz,
+        best=best,
+        alts=alts,
+        args=args
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    # === QUICK RUN SECTION (IntelliJ-friendly) ===
+    # If you run this script with NO arguments, it will try to find STL_NAME across:
+    #   - project/current directory (fast)
+    #   - then all Windows drives including flash drives (slow)
+    # If you run it with an STL argument, STL_NAME is ignored.
+    STL_NAME = "Bunker.stl.stl"  # <-- Set to just the filename OR a full path
+
+    if len(sys.argv) == 1:
+        try:
+            stl_path = find_stl_by_name(STL_NAME)
+            print(f"Auto-found STL: {stl_path}")
+            sys.argv.append(stl_path)
+        except FileNotFoundError as e:
+            print(e)
+            sys.exit(1)
+
+    main()
